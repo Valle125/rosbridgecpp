@@ -15,9 +15,6 @@
 #include <chrono>
 #include <functional>
 #include <thread>
-#include <future>
-//#include <functional>
-#include <mutex>
 
 using WsClient = SimpleWeb::SocketClient<SimpleWeb::WS>;
 using InMessage =  std::function<void(std::shared_ptr<WsClient::Connection>, std::shared_ptr<WsClient::InMessage>)>;
@@ -26,7 +23,6 @@ class RosbridgeWsClient
 {
   std::string server_port_path;
   std::unordered_map<std::string, std::shared_ptr<WsClient>> client_map;
-  std::mutex map_mutex;
 
   void start(const std::string& client_name, std::shared_ptr<WsClient> client, const std::string& message)
   {
@@ -87,6 +83,9 @@ class RosbridgeWsClient
     });
 
     client_thread.detach();
+
+    // This is to make sure that the thread got fully launched before we do anything to it (e.g. remove)
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
 public:
@@ -97,7 +96,6 @@ public:
 
   ~RosbridgeWsClient()
   {
-    std::lock_guard<std::mutex> lk(map_mutex); // neccessary?
     for (auto& client : client_map)
     {
       client.second->stop();
@@ -105,37 +103,8 @@ public:
     }
   }
 
- // The execution can take up to 100 ms!
- bool connected(){
-
-    auto p = std::make_shared<std::promise<void>>();
-    auto future = p->get_future();
-
-    auto callback = [](std::shared_ptr<WsClient::Connection> connection, std::shared_ptr<std::promise<void>> p) {
-        p->set_value();
-        connection->send_close(1000);
-    };
-    std::shared_ptr<WsClient> status_client = std::make_shared<WsClient>(server_port_path);
-    status_client->on_open = std::bind(callback, std::placeholders::_1, p);
-
-    std::async([status_client]{
-
-        status_client->start();
-        status_client->on_open = NULL;
-        status_client->on_message = NULL;
-        status_client->on_close = NULL;
-        status_client->on_error = NULL;
-
-    });
-
-    auto status = future.wait_for(std::chrono::milliseconds(100));
-    return status == std::future_status::ready;
- }
-
-  // Adds a client to the client_map.
   void addClient(const std::string& client_name)
   {
-    std::lock_guard<std::mutex> lk(map_mutex);
     std::unordered_map<std::string, std::shared_ptr<WsClient>>::iterator it = client_map.find(client_name);
     if (it == client_map.end())
     {
@@ -151,7 +120,6 @@ public:
 
   std::shared_ptr<WsClient> getClient(const std::string& client_name)
   {
-    std::lock_guard<std::mutex> lk(map_mutex);
     std::unordered_map<std::string, std::shared_ptr<WsClient>>::iterator it = client_map.find(client_name);
     if (it != client_map.end())
     {
@@ -162,7 +130,6 @@ public:
 
   void stopClient(const std::string& client_name)
   {
-    std::lock_guard<std::mutex> lk(map_mutex);
     std::unordered_map<std::string, std::shared_ptr<WsClient>>::iterator it = client_map.find(client_name);
     if (it != client_map.end())
     {
@@ -185,20 +152,12 @@ public:
 
   void removeClient(const std::string& client_name)
   {
-    std::lock_guard<std::mutex> lk(map_mutex);
     std::unordered_map<std::string, std::shared_ptr<WsClient>>::iterator it = client_map.find(client_name);
     if (it != client_map.end())
     {
-      // Stop the client asynchronously in 100 ms.
-      // This is to ensure, that all threads involving the client have been launched.
-      std::thread t([](std::shared_ptr<WsClient> client){
-         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-         client->stop();
-         client.reset();
-      },
-      it->second /*lambda param*/ );
+      it->second->stop();
+      it->second.reset();
       client_map.erase(it);
-      t.detach();
 #ifdef DEBUG
       std::cout << client_name << " has been removed" << std::endl;
 #endif
@@ -211,11 +170,8 @@ public:
 #endif
   }
 
-  // Gets the client from client_map and starts it. Advertising is essentially sending a message.
-  // One client per topic!
   void advertise(const std::string& client_name, const std::string& topic, const std::string& type, const std::string& id = "")
   {
-    std::lock_guard<std::mutex> lk(map_mutex);
     std::unordered_map<std::string, std::shared_ptr<WsClient>>::iterator it = client_map.find(client_name);
     if (it != client_map.end())
     {
@@ -269,7 +225,6 @@ public:
 
   void subscribe(const std::string& client_name, const std::string& topic, const InMessage& callback, const std::string& id = "", const std::string& type = "", int throttle_rate = -1, int queue_length = -1, int fragment_size = -1, const std::string& compression = "")
   {
-    std::lock_guard<std::mutex> lk(map_mutex);
     std::unordered_map<std::string, std::shared_ptr<WsClient>>::iterator it = client_map.find(client_name);
     if (it != client_map.end())
     {
@@ -314,7 +269,6 @@ public:
 
   void advertiseService(const std::string& client_name, const std::string& service, const std::string& type, const InMessage& callback)
   {
-    std::lock_guard<std::mutex> lk(map_mutex);
     std::unordered_map<std::string, std::shared_ptr<WsClient>>::iterator it = client_map.find(client_name);
     if (it != client_map.end())
     {
@@ -406,113 +360,6 @@ public:
     }
 
     start("call_service_client", call_service_client, message);
-  }
-
-  //!
-  //! \brief Checks if the service \p service is available.
-  //! \param service Service name.
-  //! \return Returns true if the service is available, false either.
-  //! \note Don't call this function to frequently. Use \fn waitForService() instead.
-  //!
-  bool serviceAvailable(const std::string& service)
-  {
-    const rapidjson::Document args = {};
-    const std::string& id = "";
-    const int fragment_size = -1;
-    const std::string& compression = "";
-    std::string message = "\"op\":\"call_service\", \"service\":\"" + service + "\"";
-    std::string client_name("wait_for_service_client");
-
-    if (!args.IsNull())
-    {
-      rapidjson::StringBuffer strbuf;
-      rapidjson::Writer<rapidjson::StringBuffer> writer(strbuf);
-      args.Accept(writer);
-
-      message += ", \"args\":" + std::string(strbuf.GetString());
-    }
-    if (id.compare("") != 0)
-    {
-      message += ", \"id\":\"" + id + "\"";
-    }
-    if (fragment_size > -1)
-    {
-      message += ", \"fragment_size\":" + std::to_string(fragment_size);
-    }
-    if (compression.compare("none") == 0 || compression.compare("png") == 0)
-    {
-      message += ", \"compression\":\"" + compression + "\"";
-    }
-    message = "{" + message + "}";
-
-    std::shared_ptr<WsClient> wait_for_service_client = std::make_shared<WsClient>(server_port_path);
-    std::shared_ptr<std::promise<bool>> p(std::make_shared<std::promise<bool>>());
-    auto future = p->get_future();
-#ifdef DEBUG
-    wait_for_service_client->on_message = [p, service, client_name](
-#else
-    wait_for_service_client->on_message = [p](
-#endif
-            std::shared_ptr<WsClient::Connection> connection,
-            std::shared_ptr<WsClient::InMessage> in_message){
-#ifdef DEBUG
-#endif
-        rapidjson::Document doc;
-        doc.Parse(in_message->string().c_str());
-        if ( !doc.HasParseError()
-             && doc.HasMember("result")
-             && doc["result"].IsBool()
-             && doc["result"] == true )
-        {
-#ifdef DEBUG
-            std::cout << client_name << ": "
-                      << "service " << service
-                      << " available." << std::endl;
-            std::cout << client_name << ": "
-                      << "message: " << in_message->string()
-                      << std::endl;
-#endif
-            p->set_value(true);
-        } else {
-            p->set_value(false);
-        }
-        connection->send_close(1000);
-    };
-    start(client_name, wait_for_service_client, message);
-    return future.get();
-  }
-
-  //!
-  //! \brief Waits until the service with the name \p service is available.
-  //! \param service Service name.
-  //! @note This function will block as long as the service is not available.
-  //!
-  void waitForService(const std::string& service)
-  {
-
-
-#ifdef DEBUG
-    auto s = std::chrono::high_resolution_clock::now();
-    long counter = 0;
-#endif
-    while(true)
-    {
-#ifdef DEBUG
-        ++counter;
-#endif
-        if (serviceAvailable(service)){
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Avoid excessive polling.
-    };
-#ifdef DEBUG
-    auto e = std::chrono::high_resolution_clock::now();
-    std::cout << "waitForService(): time: "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(e-s).count()
-              << " ms." << std::endl;
-    std::cout << "waitForService(): clients launched: "
-              << counter << std::endl;
-#endif
   }
 };
 

@@ -1,3 +1,6 @@
 /build
 /rapidjson/build
 /Simple-WebSocket-Server/build
+/release
+/debug
+/rosbridge_ws_client.hpp.old

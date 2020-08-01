@@ -69,6 +69,7 @@ int main() {
   rbc.subscribe("topic_subscriber", "/ztopic", subscriberCallback);
 
   // Test calling a service
+  rbc.waitForService("/zservice");
   rapidjson::Document document(rapidjson::kObjectType);
   document.AddMember("data", true, document.GetAllocator());
   rbc.callService("/zservice", callServiceCallback, document);
